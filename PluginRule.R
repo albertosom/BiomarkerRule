@@ -1,23 +1,25 @@
 
+library(caret)
+library(randomForest)
+library(ranger)
+library(SuperLearner)
+library(parallel)
 
 #'  Functions for constructing biomarker-based decision rule using the plug-in approach
 #'  
 #' @param data.train a data frame of the training set; the first column is the outcome and the rest are the covariates .
 #' @param data.test a data frame of the test set; the first column is the outcome and the rest are the covariates. 
-#'@param  data.val a data frame of the validation set; the first column is the outcome and the rest are the covariates. 
-#' @param prev Prevalence of the disease; defult is null if no prevalence value is provided otherwise estimate prevalence from data
+#' @param data.val a data frame of the validation set to estimate the constraint; the first column is the outcome and the rest are the covariates. 
+#' @param prev Prevalence of the disease; if null, we estimate prevalence from data
 #' @param alpha Pre-specified positive value (PPV) constraint
-#' @param KK Number of cross-validation (CV); we use K-fold CV to choose the cutoff value
-#' @param thres a vector of values bewteen 0 and 1 to choose a cutoff value for the rule
-#' @param data.type a case-control or cohort
-#' @param CV whether to use cross-validation (TRUE/FALSE)
+#' @param data.type a case-control or cohort type data
 #' @return A data frame where each role corresponds to estimate of TPR, PPV, FPR for each plugin approach
-#' \item{results.df}{Estimates of TPR, PPV, FPR for eahc pluin approach}
+#' \item{results.df}{Estimates of TPR, PPV, FPR on the test set for each plug-in approach}
 #' @export
 #' 
 
 
-plugin.rule<-function(data.train,data.val,data.test,prev=NULL,alpha,data.type,CV=FALSE,KK=2){
+plugin.rule<-function(data.train,data.val,data.test,prev=NULL,alpha,data.type){
   
   lambda.hat<-NA
   
@@ -48,11 +50,7 @@ plugin.rule<-function(data.train,data.val,data.test,prev=NULL,alpha,data.type,CV
   X.val<-data.matrix(X.val)
   prob.est.val <-logistic(cbind(1,X.val)%*%theta)
   
-  if(CV==TRUE){
-    lambda.hat<-kkfold.lambda(data=data.train,KK=2,method="logistic",alpha,prev)
-  }
-  if(CV==FALSE){
-    
+
     skip_to_next <- FALSE
     tryCatch(  
       lambda.hat<- uniroot(constraint,c(1e-4, 2000),prob=prob.est.val,
@@ -69,7 +67,7 @@ plugin.rule<-function(data.train,data.val,data.test,prev=NULL,alpha,data.type,CV
       constraint_alpha(lambda=100,prob=prob.est.val,
                        prev=prev,data=data.val)
     }
-  }
+  
   skip_to_next <- FALSE
   
   est.lg<-pluginEst(prev,data.train=data.train,
@@ -96,11 +94,6 @@ plugin.rule<-function(data.train,data.val,data.test,prev=NULL,alpha,data.type,CV
     
   }
   
-  if(CV==TRUE){
-    lambda.hat<-kkfold.lambda(data=data.train,KK=2,method="randomforest",alpha,prev)
-  }
-  
-  if(CV==FALSE){
     skip_to_next <- FALSE
     tryCatch(  
       lambda.hat<- uniroot(constraint,c(1e-4, 2000),prob=prob.est.val,
@@ -114,11 +107,8 @@ plugin.rule<-function(data.train,data.val,data.test,prev=NULL,alpha,data.type,CV
                                   prev=prev,data=data.val)
         , error=function(e){skip_to_next<<-TRUE}) 
     }
-  }
-  
   
   ## evaluate on testing data
-  
   est.rf<-pluginEst(prev,data.train=data.train,data.test=data.test,
                     alpha=alpha,lambda=lambda.hat,threshold=0,method="randomforest",data.type=data.type)
   
@@ -143,11 +133,6 @@ plugin.rule<-function(data.train,data.val,data.test,prev=NULL,alpha,data.type,CV
   
   gamma<-p.hat/(1-p.hat)
   
-  if(CV==TRUE){
-    lambda.hat<-kkfold.lambda(data=data.train,KK=2,method="superlearner",alpha,prev)
-  }
-  
-  if(CV==FALSE){
     skip_to_next <- FALSE
     tryCatch(  
       lambda.hat<- uniroot(constraint,c(1e-4, 2000),prob=prob.est.val,
@@ -162,15 +147,20 @@ plugin.rule<-function(data.train,data.val,data.test,prev=NULL,alpha,data.type,CV
         , error=function(e){skip_to_next<<-TRUE}) 
       
     }
-  }
-  
   ## evaluate on testing data
   est.sl<-pluginEst(prev,data.train=data.train,data.test=data.test,
                     alpha=alpha,lambda=lambda.hat,threshold=0,method="superlearner",data.type=data.type)
   
-  results.df<-rbind(est.lg,est.rf,est.sl)
+  methods_names <- c("Plugin_Logistic", "Plugin_rf", "Plugin_SL")
+  
+  results.df <- data.frame(
+    Methods = methods_names,
+    TPF = c(est.lg[1], est.rf[1], est.sl[1]),
+    PPV = c(est.lg[2], est.rf[2], est.sl[2]),
+    FPF = c(est.lg[3], est.rf[3], est.sl[3]))
   return(results.df)
 }
+
 
 
 roots.lambda<- function(f,a,b,eps=1e-03,alpha,iter=1000){
@@ -224,7 +214,6 @@ lambda_constA<-function(f,alpha,a,b,iter=1000,prob,prev,data) {
     index.opt<-which(abs(temp1)==min(abs(temp1),na.rm=T))[1]
     lambda  <- lambdas[index.opt]
   }
-  
   
   else{ 
     temp1[temp1<0]<-1
@@ -347,7 +336,7 @@ constraint<-function(lambda,prob,prev,data) {
 }
 
 
-#### CONSTRAINT THAT evaluates to alpha
+#### Function that returns estimate of PPV 
 
 constraint_alpha<-function(lambda,prob,prev,data) {
  
@@ -366,12 +355,13 @@ constraint_alpha<-function(lambda,prob,prev,data) {
 }
 
 
+## Function that returns estimate of (TPF,PPV,FPF) for each of the plug-in estimators
 
 pluginEst<- function(prev,data.train,data.test,alpha,lambda,threshold,method,data.type) {
   
   prob.est<-numeric(nrow(data.test))
   
-    if(method=="logistic") {
+    if(method=="logistic"){
       
       D.train<-data.train[,1]
       X.train<-subset(data.train,select=2:ncol(data.train))
@@ -467,8 +457,6 @@ pluginEst<- function(prev,data.train,data.test,alpha,lambda,threshold,method,dat
       gamma<-p.hat/(1-p.hat)
     }
     
-
-  
   #### estimating decision rule
   p.hat<- prev
   gamma<-p.hat/(1-p.hat)
@@ -482,125 +470,14 @@ pluginEst<- function(prev,data.train,data.test,alpha,lambda,threshold,method,dat
   FPF<- mean((data.test[data.test[,1]==0,])$pred==1)
   PPV<- prev*TPF/(prev*TPF + (1-prev)*FPF)
   ## estimators ###
+  if(TPF==1 & PPV==1){
+    print("no active constraint") 
+    return(c(NA,NA,NA))
+  }
+  else {
   return(c(TPF,PPV,FPF))
+  }
+  
 }
 
-kkfold.lambda<-function(data,KK,method="logistic",alpha,prev) {
-  
-  folds <- createFolds(data[,1], k = KK, list = TRUE, returnTrain = TRUE)
-  
-  lambdas<-numeric() 
-  
-  p.hat<- prev
-  
-  PPVs  <- rep(NA, KK)
-  TPFs <- rep(NA, KK)
-  FPFs<-rep(NA, KK)
-  
-  for (kk in 1:KK) {
-    
-    # Create training and test sets
-    
-    train_indices <- unlist(folds[-kk])
-    test_indices <- folds[[kk]]
-    
-    data.train <- data[train_indices, ]
-    data.val <- data[test_indices, ]
-    lambda.hat<-NA
-    
-    if( sum(data.val$D==1)==0 ) {
-      next
-    }
-    
-    ### creating covariate and outcome for logistic regression ###
-    n<-nrow(data.train)
-    D.train<-data.train[,1]
-    X.train<-subset(data.train,select=2:ncol(data.train))
-    X.train<-data.matrix(X.train)
-    
-    if(method=="logistic") {
-      
-      fit.logistic<-glm(D.train~X.train,family=binomial(link = "logit"))
-      theta <-fit.logistic$coefficients
-      ### Validation step ###
-      D.val<-data.val[,1]
-      X.val<-subset(data.val,select=2:ncol(data.train))
-      X.val<-data.matrix(X.val)
-      # p.hat<- mean(D.val==1)
-      gamma<-p.hat/(1-p.hat)
-      prob.est.val <-logistic(cbind(1,X.val)%*%theta)
-      
-      lambda.hat<- lambda_const(alpha,a=1e-4,b=200,iter=200,data.train, data.val,method="logistic",p.hat=p.hat)
-    
-    }
-    
-    else if (method == "randomforest") {
-      
-      ### Validation step  ###
-      D.val<-data.val[,1]
-      X.val<-subset(data.val,select=2:ncol(data.frame))
-      X.val<-data.matrix(X.val)
-      
-      gamma<-p.hat/(1-p.hat)
-      
-      rg.iris <- ranger( y = factor(D.train),x= X.train,  probability=TRUE)
-      pred.iris <- predict(rg.iris, data = X.val)
-      prob.est.val<-pred.iris$predictions[,2]
-      
-      lambda.hat<- lambda_const(alpha,a=1e-4,b=200,iter=200,data.train, data.val,method="randomforest",p.hat=p.hat)
-    }
-    
-    else if(method=="superlearner") {
-      
-      D.val<-data.val[,1]
-      X.val<-subset(data.val,select=2:ncol(data.train))
-      X.val<-data.matrix(X.val)
-     
-      gamma<-p.hat/(1-p.hat)
-      
-      SL.lib <- c("SL.mean", "SL.glm", "SL.gam")
-      
-      fit1 <- SuperLearner(Y = D.train, X = data.frame(X.train), 
-                           SL.library = SL.lib, family = 'binomial', method = 'method.NNLS')
-      
-      prob.est.val<-predict(fit1, newdata = data.frame(X.val),onlySL = TRUE)$pred
-      lambda.hat<- lambda_const(alpha,a=1e-4,b=100,iter=200,data.train, data.val,method="randomforest",p.hat=p.hat)
-      
-    }
-    
-    if(lambda.hat==Inf|is.na(lambda.hat)){
-      next
-    }
-    lambdas[kk]<-lambda.hat  
-    lambda<-lambda.hat
-    
-    eta1<-prob.est.val/p.hat
-    eta0<-(1-prob.est.val)/(1-p.hat)
-    d.x<-  eta1 - gamma*alpha*lambda*eta1 - lambda*alpha*eta0 + lambda*gamma*eta1
-    data.val$pred <- ifelse(d.x > threshold, 1, 0)
-    
-    TPFs[kk]<- mean((data.val[data.val[,1]==1,])$pred==1)
-    PPVs[kk]<- ifelse(sum(data.val$pred==1)==0,0,mean((data.val[data.val$pred==1,])[,1]==1))
-    FPFs[kk]<- mean((data.val[data.val[,1]==0,])$pred==1)
-    
-  }
-  PPVs<-na.omit(PPVs)
-  TPFs<-na.omit(TPFs)
-  
-  temp<-PPVs-alpha
-  
-  temp1<-temp
-  temp1[temp1 < 0] <- 1
-  min.constraint<-which(temp1==min((temp1),na.rm=T))
-  lambda.opt<-lambdas[min.constraint]
-  TPFscut<-TPFs[min.constraint]
-  
-  if(length(lambda.opt)>1)
-  {
-    lambda.opt=lambda.opt[which(TPFscut==max(TPFscut,na.rm=T))]
-  }
-  
-  return(lambda.opt[1])
-  
-}
 
